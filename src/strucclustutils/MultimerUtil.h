@@ -33,44 +33,23 @@ struct Chain {
     Chain(unsigned int complexId, unsigned int chainKey) : complexId(complexId), chainKey(chainKey) {}
     unsigned int complexId;
     unsigned int chainKey;
-    std::vector<float> caVecX;
-    std::vector<float> caVecY;
-    std::vector<float> caVecZ;
 };
 
 struct ChainToChainAln {
     ChainToChainAln() {}
-    ChainToChainAln(Chain &queryChain, Chain &targetChain, float *qCaData, float *dbCaData, Matcher::result_t &alnResult, TMaligner::TMscoreResult &tmResult) : qChain(queryChain), dbChain(targetChain), tmScore((float)tmResult.tmscore) {
+    // Lightweight: store only clustering metadata + the serialized alignment line. The matched CA
+    // coordinates are NOT kept here -- for a very large complex they would be up to qChains*dbChains
+    // vectors and dominate memory. They are re-decoded on demand (from the alnLines row + the CA DB)
+    // for the few alns that survive into a final cluster, when the Assignment is built. `matches` is
+    // just the number of 'M' columns in the backtrace.
+    ChainToChainAln(Chain &queryChain, Chain &targetChain, Matcher::result_t &alnResult, TMaligner::TMscoreResult &tmResult) : qChain(queryChain), dbChain(targetChain), tmScore((float)tmResult.tmscore) {
         alnLength = alnResult.alnLength;
         matches = 0;
-        unsigned int qPos = alnResult.qStartPos;
-        unsigned int dbPos = alnResult.dbStartPos;
-        unsigned int qXPos = 0;
-        unsigned int qYPos = alnResult.qLen;
-        unsigned int qZPos = alnResult.qLen * 2;
-        unsigned int dbXPos = 0;
-        unsigned int dbYPos = alnResult.dbLen;
-        unsigned int dbZPos = alnResult.dbLen * 2;
         for (char cigar : alnResult.backtrace) {
-            switch (cigar) {
-                case 'M':
-                    matches++;
-                    qChain.caVecX.emplace_back(qCaData[qXPos + qPos]);
-                    qChain.caVecY.emplace_back(qCaData[qYPos + qPos]);
-                    qChain.caVecZ.emplace_back(qCaData[qZPos + qPos++]);
-                    dbChain.caVecX.emplace_back(dbCaData[dbXPos + dbPos]);
-                    dbChain.caVecY.emplace_back(dbCaData[dbYPos + dbPos]);
-                    dbChain.caVecZ.emplace_back(dbCaData[dbZPos + dbPos++]);
-                    break;
-                case 'I':
-                    qPos++;
-                    break;
-                case 'D':
-                    dbPos++;
-                    break;
+            if (cigar == 'M') {
+                matches++;
             }
         }
-        char buffer[4096];
         label = INITIALIZED_LABEL;
         superposition[0] = tmResult.u[0][0];
         superposition[1] = tmResult.u[0][1];
@@ -84,18 +63,24 @@ struct ChainToChainAln {
         superposition[9] = tmResult.t[0];
         superposition[10] = tmResult.t[1];
         superposition[11] = tmResult.t[2];
-        size_t len = Matcher::resultToBuffer(buffer, alnResult, true, true, false);
-        resultToWrite.append(buffer, len-1);
     }
 
     Chain qChain;
     Chain dbChain;
     unsigned int matches;
     unsigned int alnLength;
-    resultToWrite_t resultToWrite;
     double superposition[SIZE_OF_SUPERPOSITION_VECTOR];
     unsigned int label;
     float tmScore;
+    // Positions of qChain/dbChain within their complex rosters (qChainKeys/dbChainKeys). Set once when
+    // the alignment is built, so DBSCAN can index per-chain state by a dense local id instead of a map
+    // keyed by chainKey. Rosters come from the DBReader lookup sorted by key, so the id is a lower_bound.
+    unsigned int qLocalId;
+    unsigned int dbLocalId;
+    // Index into the query complex's alnLines vector. The alignment row string is re-parsed from there
+    // on demand (only for alns that reach a final cluster), instead of storing a resultToWrite copy in
+    // every alignment -- saves a per-aln string for the millions that never make it into a cluster.
+    unsigned int lineIdx;
 
     float getDistance(const ChainToChainAln &o) const {
         float dist = 0;
@@ -106,13 +91,6 @@ struct ChainToChainAln {
     }
 
     void free() {
-        qChain.caVecX.clear();
-        qChain.caVecY.clear();
-        qChain.caVecZ.clear();
-        dbChain.caVecX.clear();
-        dbChain.caVecY.clear();
-        dbChain.caVecZ.clear();
-        resultToWrite.clear();
     }
 };
 

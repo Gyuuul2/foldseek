@@ -12,6 +12,7 @@
 #include "FileUtil.h"
 #include "LDDT.h"
 #include <map>
+#include <algorithm>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -21,7 +22,10 @@
 // carrying chainToChainAlignments from the same query and target complex
 struct SearchResult {
     SearchResult() {}
-    SearchResult(std::vector<unsigned int> &qChainKeys, unsigned int qResidueLen, std::vector<unsigned int> &dbChainKeys, unsigned int dbResidueLen, const std::vector<ChainToChainAln> &alnVec) : qChainKeys(qChainKeys), dbChainKeys(dbChainKeys), qResidueLen(qResidueLen), dbResidueLen(dbResidueLen), alnVec(alnVec) {}
+    // alnVec is moved in: for a very large complex it holds up to qChains*dbChains coordinate-heavy
+    // entries, so a deep copy here would double the read-path peak memory. The caller (currAlns) is
+    // cleared before its next use, so the move is safe and the contents are byte-identical.
+    SearchResult(std::vector<unsigned int> &qChainKeys, unsigned int qResidueLen, std::vector<unsigned int> &dbChainKeys, unsigned int dbResidueLen, std::vector<ChainToChainAln> &alnVec) : qChainKeys(qChainKeys), dbChainKeys(dbChainKeys), qResidueLen(qResidueLen), dbResidueLen(dbResidueLen), alnVec(std::move(alnVec)) {}
 
     std::vector<unsigned int> qChainKeys;
     std::vector<unsigned int> dbChainKeys;
@@ -95,17 +99,8 @@ struct Assignment {
     resultToWrite_t filterResult;
     unsigned int assignmentId;
 
-    void appendChainToChainAln(ChainToChainAln &aln) {
-        matches += aln.matches;
-        qCaXVec.insert(qCaXVec.end(), aln.qChain.caVecX.begin(), aln.qChain.caVecX.end());
-        qCaYVec.insert(qCaYVec.end(), aln.qChain.caVecY.begin(), aln.qChain.caVecY.end());
-        qCaZVec.insert(qCaZVec.end(), aln.qChain.caVecZ.begin(), aln.qChain.caVecZ.end());
-        dbCaXVec.insert(dbCaXVec.end(), aln.dbChain.caVecX.begin(), aln.dbChain.caVecX.end());
-        dbCaYVec.insert(dbCaYVec.end(), aln.dbChain.caVecY.begin(), aln.dbChain.caVecY.end());
-        dbCaZVec.insert(dbCaZVec.end(), aln.dbChain.caVecZ.begin(), aln.dbChain.caVecZ.end());
-        matchLenVec.push_back(aln.matches);
-        chainToChainResults.emplace_back(aln.qChain.chainKey, aln.resultToWrite);
-    }
+    // Matched CA coordinates are appended by ComplexScorer::appendClusterAln (it re-decodes them from
+    // the CA DB), since ChainToChainAln no longer carries the coordinate vectors.
 
     void reset() {
         matches = 0;
@@ -240,9 +235,98 @@ void getResult(std::string &result, std::string &currentResult, const Assignment
     result.append(currentResult);
 }
 
+// Below this many alignments the brute-force O(n) neighbor scan is cheaper than building a tree.
+// (Memory is O(n) on both paths; this only trades tree-build overhead vs scan cost.)
+#define KD_TREE_MIN_POINTS 64
+
+// Adaptive neighbor search for DBSCAN. For large alignment counts we build a k-d tree over the
+// 12-D superposition vectors so an eps-radius neighbor query costs ~O(log n) instead of O(n),
+// with only O(n) memory (no O(n^2) distance matrix). Descent uses a small margin so a true
+// neighbor (by the exact ChainToChainAln::getDistance) is never pruned away; the exact distance
+// test decides membership, so the returned set is identical to the brute-force scan.
+class SuperpositionKdTree {
+public:
+    void build(const std::vector<ChainToChainAln> &alns) {
+        alns_ = &alns;
+        size_t n = alns.size();
+        point_.assign(n, 0);
+        splitAxis_.assign(n, 0);
+        left_.assign(n, -1);
+        right_.assign(n, -1);
+        order_.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            order_[i] = (unsigned int) i;
+        }
+        nodeCount_ = 0;
+        root_ = buildRec(0, n, 0);
+    }
+
+    // Appends every j (j != queryIdx) with getDistance(queryIdx, j) < eps. Order is unspecified;
+    // the caller sorts to match the brute-force ordering.
+    void rangeQuery(unsigned int queryIdx, float eps, std::vector<unsigned int> &out) const {
+        queryRec(root_, queryIdx, eps, out);
+    }
+
+private:
+    const std::vector<ChainToChainAln> *alns_;
+    std::vector<unsigned int> point_;   // node id -> alignment index
+    std::vector<int> splitAxis_;
+    std::vector<int> left_;
+    std::vector<int> right_;
+    std::vector<unsigned int> order_;   // working index buffer (partitioned during build)
+    int root_;
+    int nodeCount_;
+
+    int buildRec(size_t lo, size_t hi, int depth) {
+        if (lo >= hi) {
+            return -1;
+        }
+        const std::vector<ChainToChainAln> &alns = *alns_;
+        int axis = depth % (int) SIZE_OF_SUPERPOSITION_VECTOR;
+        size_t mid = lo + (hi - lo) / 2;
+        std::nth_element(order_.begin() + lo, order_.begin() + mid, order_.begin() + hi,
+            [&alns, axis](unsigned int a, unsigned int b) {
+                return alns[a].superposition[axis] < alns[b].superposition[axis];
+            });
+        int node = nodeCount_++;
+        point_[node] = order_[mid];
+        splitAxis_[node] = axis;
+        left_[node] = buildRec(lo, mid, depth + 1);
+        right_[node] = buildRec(mid + 1, hi, depth + 1);
+        return node;
+    }
+
+    void queryRec(int node, unsigned int q, float eps, std::vector<unsigned int> &out) const {
+        if (node < 0) {
+            return;
+        }
+        const std::vector<ChainToChainAln> &alns = *alns_;
+        unsigned int p = point_[node];
+        if (p != q && alns[q].getDistance(alns[p]) < eps) {
+            out.emplace_back(p);
+        }
+        int axis = splitAxis_[node];
+        double diff = (double) alns[q].superposition[axis] - (double) alns[p].superposition[axis];
+        // conservative: also descend the far side unless it is provably beyond eps
+        double reach = (double) eps + ((double) eps * 1e-3 + 1e-4);
+        if (diff <= 0.0) {
+            queryRec(left_[node], q, eps, out);
+            if (-diff < reach) {
+                queryRec(right_[node], q, eps, out);
+            }
+        } else {
+            queryRec(right_[node], q, eps, out);
+            if (diff < reach) {
+                queryRec(left_[node], q, eps, out);
+            }
+        }
+    }
+};
+
 class DBSCANCluster {
 public:
     DBSCANCluster(SearchResult &searchResult, std::set<cluster_t> &finalClusters, float minCov) : searchResult(searchResult), finalClusters(finalClusters) {
+        useKdTree = false;
         cLabel = 0;
         minimumClusterSize = std::ceil((float) searchResult.qChainKeys.size() * minCov);
         maximumClusterSize = std::min(searchResult.qChainKeys.size(), searchResult.dbChainKeys.size());
@@ -260,7 +344,13 @@ public:
 
         // rbh filter
         filterAlnsByRBH();
-        fillDistMatrix();
+        initEpsRange();
+        // For large alignment counts, a k-d tree makes neighbor queries ~O(log n) with O(n) memory;
+        // small counts stay on the brute-force scan. alnVec is fixed from here (only labels change).
+        useKdTree = searchResult.alnVec.size() > KD_TREE_MIN_POINTS;
+        if (useKdTree) {
+            kdTree.build(searchResult.alnVec);
+        }
         // To skip DBSCAN clustering when alignments are few enough.
         if (searchResult.alnVec.size() <= maximumClusterSize)
             return checkClusteringNecessity();
@@ -282,15 +372,26 @@ private:
     unsigned int minimumClusterSize;
     std::vector<unsigned int> neighbors;
     std::vector<unsigned int> neighborsOfCurrNeighbor;
-    std::unordered_set<unsigned int> foundNeighbors;
+    // Membership set of alignment indices already pulled into the current cluster, kept as a reused
+    // epoch-stamped array instead of a hash set: foundEpoch[i] == curEpoch means "already added". Bumping
+    // curEpoch per cluster is an O(1) clear, so there is no per-cluster hashing or reallocation.
+    std::vector<size_t> foundEpoch;
+    size_t curEpoch;
     std::vector<NeighborsWithDist> neighborsWithDist;
-    std::unordered_set<unsigned int> qFoundChainKeys;
-    std::unordered_set<unsigned int> dbFoundChainKeys;
-    std::vector<float> distMatrix;
+    // "chain already seen" sets, kept as reused epoch-stamped arrays indexed by local chain id instead
+    // of hash sets of chain keys: qFoundEpoch[localId] == chainEpoch means seen. Bumping chainEpoch is
+    // an O(1) clear. Sized to the rosters in filterAlnsByRBH (the first user of a query/target pair).
+    std::vector<size_t> qFoundEpoch;
+    std::vector<size_t> dbFoundEpoch;
+    size_t chainEpoch;
     std::vector<cluster_t> currClusters;
     std::set<cluster_t> &finalClusters;
-    std::map<unsigned int, float> qBestTmScore;
-    std::map<unsigned int, float> dbBestTmScore;
+    // Best tmScore per query/target chain, indexed by the chain's local id (position in its roster),
+    // reused across pairs -- replaces the old chainKey-keyed std::map.
+    std::vector<float> qBestScore;
+    std::vector<float> dbBestScore;
+    bool useKdTree;
+    SuperpositionKdTree kdTree;
 
     bool earlyStopForMonomers() {
         if (minimumClusterSize >= MULTIPLE_CHAINED_COMPLEX)
@@ -311,6 +412,8 @@ private:
     bool runDBSCAN() {
         unsigned int neighborIdx;
         unsigned int neighborAlnIdx;
+        foundEpoch.assign(searchResult.alnVec.size(), 0);
+        curEpoch = 0;
         while (eps < maxDist) {
             initializeAlnLabels();
             for (size_t centerAlnIdx = 0; centerAlnIdx < searchResult.alnVec.size(); centerAlnIdx++) {
@@ -323,8 +426,10 @@ private:
                     continue;
 
                 centerAln.label = ++cLabel;
-                foundNeighbors.clear();
-                foundNeighbors.insert(neighbors.begin(), neighbors.end());
+                curEpoch++;
+                for (auto initNeighbor : neighbors) {
+                    foundEpoch[initNeighbor] = curEpoch;
+                }
                 neighborIdx = 0;
                 while (neighborIdx < neighbors.size()) {
                     neighborAlnIdx = neighbors[neighborIdx++];
@@ -338,8 +443,10 @@ private:
                         continue;
 
                     for (auto neighbor : neighborsOfCurrNeighbor) {
-                        if (foundNeighbors.insert(neighbor).second)
+                        if (foundEpoch[neighbor] != curEpoch) {
+                            foundEpoch[neighbor] = curEpoch;
                             neighbors.emplace_back(neighbor);
+                        }
                     }
                 }
                 if (neighbors.size() > maximumClusterSize || checkChainRedundancy())
@@ -384,24 +491,17 @@ private:
         return finishDBSCAN();
     }
 
-    size_t getDistMatrixIndex(size_t i, size_t j) const {
-            if (i > j) std::swap(i, j); // Ensure i <= j for symmetry
-            size_t n = searchResult.alnVec.size();
-            return (2 * n *i - i - i * i) / 2 + j - i - 1;
-    }
-
-    void fillDistMatrix() {
-        size_t size = searchResult.alnVec.size();
-        float dist;
-        distMatrix.resize(size * (size - 1) / 2, 0.0f);
+    // Lazy DBSCAN: no O(n^2) distance matrix is stored -- materializing N(N-1)/2 floats OOMs for very
+    // large complexes (e.g. a 1356-mer would need terabytes). This single pass only determines the eps
+    // range (min/max pairwise distance); individual distances are recomputed on demand in
+    // getNeighbors/getNearestNeighbors via ChainToChainAln::getDistance (a cheap 12-dim vector distance).
+    void initEpsRange() {
         for (size_t i = 0; i < searchResult.alnVec.size(); i++) {
             const ChainToChainAln &prevAln = searchResult.alnVec[i];
             for (size_t j = i + 1; j < searchResult.alnVec.size(); j++) {
-                const ChainToChainAln &currAln = searchResult.alnVec[j];
-                dist = prevAln.getDistance(currAln);
+                float dist = prevAln.getDistance(searchResult.alnVec[j]);
                 maxDist = std::max(maxDist, dist);
                 minDist = std::min(minDist, dist);
-                distMatrix[getDistMatrixIndex(i, j)] = dist;
             }
         }
         eps = minDist;
@@ -410,12 +510,19 @@ private:
     void getNeighbors(size_t centerIdx, std::vector<unsigned int> &neighborVec) const {
         neighborVec.clear();
         neighborVec.emplace_back(centerIdx);
+        if (useKdTree) {
+            // tree returns the same set as the scan below; sort to reproduce ascending-index order
+            kdTree.rangeQuery(centerIdx, eps, neighborVec);
+            std::sort(neighborVec.begin() + 1, neighborVec.end());
+            return;
+        }
+        const ChainToChainAln &centerAln = searchResult.alnVec[centerIdx];
         for (size_t neighborIdx = 0; neighborIdx < searchResult.alnVec.size(); neighborIdx++) {
 
             if (neighborIdx == centerIdx)
                 continue;
 
-            if (distMatrix[getDistMatrixIndex(centerIdx, neighborIdx)] >= eps)
+            if (centerAln.getDistance(searchResult.alnVec[neighborIdx]) >= eps)
                 continue;
 
             neighborVec.emplace_back(neighborIdx);
@@ -432,15 +539,16 @@ private:
     }
 
     bool checkChainRedundancy() {
-        qFoundChainKeys.clear();
-        dbFoundChainKeys.clear();
-
+        chainEpoch++;
         for (auto neighborIdx : neighbors) {
-            if (!qFoundChainKeys.insert(searchResult.alnVec[neighborIdx].qChain.chainKey).second)
+            const ChainToChainAln &aln = searchResult.alnVec[neighborIdx];
+            if (qFoundEpoch[aln.qLocalId] == chainEpoch)
                 return true;
+            qFoundEpoch[aln.qLocalId] = chainEpoch;
 
-            if (!dbFoundChainKeys.insert(searchResult.alnVec[neighborIdx].dbChain.chainKey).second)
+            if (dbFoundEpoch[aln.dbLocalId] == chainEpoch)
                 return true;
+            dbFoundEpoch[aln.dbLocalId] = chainEpoch;
         }
         return false;
     }
@@ -468,76 +576,118 @@ private:
         neighbors.clear();
         neighborsOfCurrNeighbor.clear();
         neighborsWithDist.clear();
-        qBestTmScore.clear();
-        dbBestTmScore.clear();
-        qFoundChainKeys.clear();
-        dbFoundChainKeys.clear();
-        distMatrix.clear();
         return !finalClusters.empty();
     }
 
     void filterAlnsByRBH() {
-        qBestTmScore.clear();
-        dbBestTmScore.clear();
-        qFoundChainKeys.clear();
-        dbFoundChainKeys.clear();
-        for (auto qChainKey: searchResult.qChainKeys) {
-            qBestTmScore.insert({qChainKey, FLT_MIN});
-        }
-        for (auto dbChainKey: searchResult.dbChainKeys) {
-            dbBestTmScore.insert({dbChainKey, FLT_MIN});
-        }
+        // best tmScore per chain, indexed by dense local id (position in the roster) instead of a map
+        qBestScore.assign(searchResult.qChainKeys.size(), FLT_MIN);
+        dbBestScore.assign(searchResult.dbChainKeys.size(), FLT_MIN);
+        // size (and reset) the "chain seen" epoch arrays for this query/target pair -- reused by
+        // checkChainRedundancy/getNearestNeighbors, which only bump chainEpoch afterwards.
+        qFoundEpoch.assign(searchResult.qChainKeys.size(), 0);
+        dbFoundEpoch.assign(searchResult.dbChainKeys.size(), 0);
+        chainEpoch = 0;
         for (auto &aln: searchResult.alnVec) {
-            unsigned int qKey = aln.qChain.chainKey;
-            unsigned int dbKey = aln.dbChain.chainKey;
-            float tmScore = aln.tmScore;
-            qBestTmScore[qKey] = std::max(tmScore, qBestTmScore[qKey]);
-            dbBestTmScore[dbKey] = std::max(tmScore, dbBestTmScore[dbKey]);
+            qBestScore[aln.qLocalId] = std::max(aln.tmScore, qBestScore[aln.qLocalId]);
+            dbBestScore[aln.dbLocalId] = std::max(aln.tmScore, dbBestScore[aln.dbLocalId]);
         }
-        size_t alnIdx = 0;
-        while (alnIdx < searchResult.alnVec.size()) {
-            unsigned int qKey = searchResult.alnVec[alnIdx].qChain.chainKey;
-            unsigned int dbKey = searchResult.alnVec[alnIdx].dbChain.chainKey;
-            float tmScore = searchResult.alnVec[alnIdx].tmScore;
-            if (tmScore < std::max(qBestTmScore[qKey], dbBestTmScore[dbKey]) * TM_SCORE_MARGIN) {
-                searchResult.alnVec.erase(searchResult.alnVec.begin() + alnIdx);
+        // Single-pass in-place compaction (erase-remove idiom): drop alns below the RBH margin by
+        // moving the kept ones forward, then truncate once. Equivalent to the previous per-element
+        // vector::erase but O(n) moves instead of O(n^2) -- the old erase shifted the whole tail of a
+        // coordinate-heavy vector on every drop, which is catastrophic for very large complexes. Kept
+        // set and order are identical, so the output is byte-identical. qFoundNum/dbFoundNum count the
+        // distinct kept query/target chains (what the old qFound/dbFound set sizes measured).
+        chainEpoch++;
+        size_t qFoundNum = 0;
+        size_t dbFoundNum = 0;
+        size_t writeIdx = 0;
+        for (size_t readIdx = 0; readIdx < searchResult.alnVec.size(); readIdx++) {
+            ChainToChainAln &aln = searchResult.alnVec[readIdx];
+            if (aln.tmScore < std::max(qBestScore[aln.qLocalId], dbBestScore[aln.dbLocalId]) * TM_SCORE_MARGIN) {
                 continue;
             }
-            qFoundChainKeys.insert(qKey);
-            dbFoundChainKeys.insert(dbKey);
-            alnIdx++;
+            if (qFoundEpoch[aln.qLocalId] != chainEpoch) {
+                qFoundEpoch[aln.qLocalId] = chainEpoch;
+                qFoundNum++;
+            }
+            if (dbFoundEpoch[aln.dbLocalId] != chainEpoch) {
+                dbFoundEpoch[aln.dbLocalId] = chainEpoch;
+                dbFoundNum++;
+            }
+            if (writeIdx != readIdx) {
+                searchResult.alnVec[writeIdx] = std::move(searchResult.alnVec[readIdx]);
+            }
+            writeIdx++;
         }
+        searchResult.alnVec.resize(writeIdx);
 
-        if (std::min(qFoundChainKeys.size(), dbFoundChainKeys.size()) < minimumClusterSize)
+        if (std::min(qFoundNum, dbFoundNum) < minimumClusterSize)
             searchResult.alnVec.clear();
     }
 
     void getNearestNeighbors(unsigned int centerIdx) {
-        qFoundChainKeys.clear();
-        dbFoundChainKeys.clear();
+        chainEpoch++;
         neighborsWithDist.clear();
         neighborsWithDist.emplace_back(centerIdx, 0.0);
         for (auto neighborIdx: neighbors) {
             if (neighborIdx == centerIdx)
                 continue;
-            neighborsWithDist.emplace_back(neighborIdx, distMatrix[getDistMatrixIndex(centerIdx, neighborIdx)]);
+            neighborsWithDist.emplace_back(neighborIdx, searchResult.alnVec[centerIdx].getDistance(searchResult.alnVec[neighborIdx]));
         }
         SORT_SERIAL(neighborsWithDist.begin(), neighborsWithDist.end(), compareNeighborWithDist);
         neighbors.clear();
         for (auto neighborWithDist : neighborsWithDist) {
-            if (!qFoundChainKeys.insert(searchResult.alnVec[neighborWithDist.neighbor].qChain.chainKey).second)
+            const ChainToChainAln &aln = searchResult.alnVec[neighborWithDist.neighbor];
+            if (qFoundEpoch[aln.qLocalId] == chainEpoch)
                 break;
-            if (!dbFoundChainKeys.insert(searchResult.alnVec[neighborWithDist.neighbor].dbChain.chainKey).second)
+            qFoundEpoch[aln.qLocalId] = chainEpoch;
+            if (dbFoundEpoch[aln.dbLocalId] == chainEpoch)
                 break;
+            dbFoundEpoch[aln.dbLocalId] = chainEpoch;
             neighbors.emplace_back(neighborWithDist.neighbor);
         }
     }
 };
 
+// One parsed alignment line, tagged with its target complex. The whole query complex's lines are
+// streamed into a reused vector (mmseqs style: no std::map, no random access), then sorted so that a
+// target complex's chains are contiguous. `line` is the raw (compressed) alignment record copied out
+// of the DB, because the DBReader data pointer is only valid until the next getData on another key.
+struct AlnLine {
+    AlnLine(unsigned int dbComplexId, unsigned int qChainKey, unsigned int dbChainKey, unsigned int ordinal, unsigned int lineOffset)
+        : dbComplexId(dbComplexId), qChainKey(qChainKey), dbChainKey(dbChainKey), ordinal(ordinal), lineOffset(lineOffset) {}
+    unsigned int dbComplexId;
+    unsigned int qChainKey;
+    unsigned int dbChainKey;
+    unsigned int ordinal;      // position in reading order; tiebreaker so the first row of a duplicate
+                               // (qChainKey,dbChainKey) is the one the old std::map<...>.insert kept.
+    unsigned int lineOffset;   // start of the null-terminated alignment row in ComplexScorer::lineArena
+};
+
+// Sort by (target complex, query chain, target chain, reading order). The primary key groups a target
+// complex's lines into one contiguous run in ascending complex-id order, which keeps the later
+// (unstable) assignment sort byte-identical to the previous full loop; the secondary keys make the
+// order within a group deterministic. The ordinal tiebreaker guarantees that among duplicate
+// (qChainKey,dbChainKey) rows the reading-first one comes first, so scoreDbComplexGroup can keep just
+// it -- matching the old map, which ignored later rows for an already-seen (qChainKey,dbChainKey).
+bool compareAlnLine(const AlnLine &first, const AlnLine &second) {
+    if (first.dbComplexId != second.dbComplexId) {
+        return first.dbComplexId < second.dbComplexId;
+    }
+    if (first.qChainKey != second.qChainKey) {
+        return first.qChainKey < second.qChainKey;
+    }
+    if (first.dbChainKey != second.dbChainKey) {
+        return first.dbChainKey < second.dbChainKey;
+    }
+    return first.ordinal < second.ordinal;
+}
+
 class ComplexScorer {
 public:
-    ComplexScorer(IndexReader *q3diDbr, IndexReader *t3diDbr, DBReader<unsigned int> &alnDbr, DBReader<unsigned int> *qCaDbr, DBReader<unsigned int> *tCaDbr, unsigned int thread_idx, float minAssignedChainsRatio, int monomerIncludeMode)
-        : q3diDbr(q3diDbr), t3diDbr(t3diDbr), alnDbr(alnDbr), qCaDbr(qCaDbr), tCaDbr(tCaDbr), thread_idx(thread_idx), minAssignedChainsRatio(minAssignedChainsRatio), monomerIncludeMode(monomerIncludeMode)  {
+    ComplexScorer(IndexReader *q3diDbr, IndexReader *t3diDbr, DBReader<unsigned int> &alnDbr, DBReader<unsigned int> *qCaDbr, DBReader<unsigned int> *tCaDbr, DBReader<unsigned int> *dbLookupReader, unsigned int thread_idx, float minAssignedChainsRatio, int monomerIncludeMode)
+        : q3diDbr(q3diDbr), t3diDbr(t3diDbr), alnDbr(alnDbr), qCaDbr(qCaDbr), tCaDbr(tCaDbr), dbLookupReader(dbLookupReader), thread_idx(thread_idx), minAssignedChainsRatio(minAssignedChainsRatio), monomerIncludeMode(monomerIncludeMode)  {
         maxChainLen = std::max(q3diDbr->sequenceReader->getMaxSeqLen()+1, t3diDbr->sequenceReader->getMaxSeqLen()+1);
         maxResLen = maxChainLen * 2;
         tmAligner = new TMaligner(maxResLen, false, true, false);
@@ -546,7 +696,14 @@ public:
         delete tmAligner;
     }
 
-    void getSearchResultLinesMap(std::vector<unsigned int> &qChainKeys, alignmentLinesMap_t &alignmentLinesMap) {
+    // Stream every alignment line of the whole query complex into a reused vector (mmseqs style: one
+    // getData per query chain, parse the record keys in place, no std::map, no random access), tagging
+    // each with its target complex, then sort so each target complex is one contiguous run. Target
+    // chains absent from the target sequence DB (e.g. cluster-search DBs keep only representatives) are
+    // skipped here -- exactly the chains the old code kept in the map but never consumed. Sets qResLen.
+    void buildAlnLines(std::vector<unsigned int> &qChainKeys, std::vector<AlnLine> &alnLines) {
+        alnLines.clear();
+        lineArena.clear();
         qResLen = getQueryResidueLength(qChainKeys);
         if (qResLen == 0) {
             return;
@@ -567,63 +724,109 @@ public:
             while (*data != '\0') {
                 Util::parseKey(data, dbKeyBuffer);
                 const auto dbChainKey = static_cast<unsigned int>(strtoul(dbKeyBuffer, NULL, 10));
-                Util::getLine(data, dataSize, lineBuffer, 1024);
-                alignmentLinesMap.insert({{qChainKey, dbChainKey}, static_cast<std::string>(lineBuffer)});
+                size_t lookupId = dbLookupReader->getLookupIdByKey(dbChainKey);
+                // keep only target chains that resolve to a complex AND are present in the target
+                // sequence DB (== the chains dbComplexIdToChainKeys buckets, i.e. the ones the old loop
+                // actually processed); anything else never contributed to the output.
+                if (lookupId != SIZE_MAX && t3diDbr->sequenceReader->getId(dbChainKey) != NOT_AVAILABLE_CHAIN_KEY) {
+                    unsigned int dbComplexId = dbLookupReader->getLookupFileNumber(lookupId);
+                    Util::getLine(data, dataSize, lineBuffer, 1024);
+                    unsigned int lineOffset = (unsigned int) lineArena.size();
+                    lineArena.insert(lineArena.end(), lineBuffer, lineBuffer + strlen(lineBuffer) + 1);
+                    alnLines.emplace_back(dbComplexId, qChainKey, dbChainKey, (unsigned int)alnLines.size(), lineOffset);
+                }
                 data = Util::skipLine(data);
             } // while end
         } // for end
+        SORT_SERIAL(alnLines.begin(), alnLines.end(), compareAlnLine);
     }
 
-    void getSearchResultByDbComplex(unsigned int qComplexId, unsigned int dbComplexId, std::vector<unsigned int> &qChainKeys, std::vector<unsigned int> &dbChainKeys, alignmentLinesMap_t &alignmentLinesMap, SearchResult &searchResult) {
-        bool hasBacktrace = false;
+    // Score one target complex: the contiguous run alnLines[lo, hi) all share dbComplexId and is sorted
+    // by (qChainKey, dbChainKey). Builds currAlns and fills searchResult, or leaves it empty (skip).
+    void scoreDbComplexGroup(unsigned int qComplexId, unsigned int dbComplexId, std::vector<unsigned int> &qChainKeys, std::vector<unsigned int> &dbChainKeys, std::vector<AlnLine> &alnLines, size_t lo, size_t hi, SearchResult &searchResult) {
         unsigned int dbResLen = getDbResidueLength(dbChainKeys);
         if (dbResLen == 0) {
-            removeCurrAlnLines(qChainKeys, dbChainKeys, alignmentLinesMap);
+            return;
+        }
+        // Abandon rule (mirrors the old per-query getQueryAlnResult early-return): the pair is scored
+        // only if EVERY query chain of the complex has at least one alignment to this target complex.
+        // The run is sorted by qChainKey, so the number of distinct query chains present is the number
+        // of qChainKey boundaries; if it does not cover the whole roster, skip.
+        size_t distinctQ = 0;
+        for (size_t i = lo; i < hi; i++) {
+            if (i == lo || alnLines[i].qChainKey != alnLines[i - 1].qChainKey) {
+                distinctQ++;
+            }
+        }
+        if (distinctQ != qChainKeys.size()) {
             return;
         }
 
         Coordinate16 qCoords;
         Coordinate16 tCoords;
         currAlns.clear();
-        Chain qChain;
-        Chain dbChain;
-        // for each chain from the query Complex
-        for (auto qChainKey: qChainKeys) {
-            Matcher::result_t qAlnResult;
-            if (!getQueryAlnResult(qChainKey, dbChainKeys, alignmentLinesMap, qAlnResult)) {
-                return;
-            }
-            size_t qDbId = qCaDbr->getId(qChainKey);
-            char *qCaData = qCaDbr->getData(qDbId, thread_idx);
-            size_t qCaLength = qCaDbr->getEntryLen(qDbId);
-            unsigned int qLen = qAlnResult.qLen;
-            float *queryCaData = qCoords.read(qCaData, qAlnResult.qLen, qCaLength);
-            qChain = Chain(qComplexId, qChainKey);
-            tmAligner->initQuery(queryCaData, &queryCaData[qLen], &queryCaData[qLen * 2], NULL, qLen);
-            // for each alignment from the query chain
-            for (auto dbChainKey: dbChainKeys) {
-                std::string &data = alignmentLinesMap[{qChainKey, dbChainKey}];
-                if (data.empty()) {
-                    alignmentLinesMap.erase({qChainKey, dbChainKey});
+        // reset the per-target-complex CA decode cache
+        tCaOffset.assign(dbChainKeys.size(), ~0u);
+        tCaArena.clear();
+        bool hasBacktrace = false;
+        // for each query chain (its lines are contiguous in the sorted run)
+        size_t i = lo;
+        while (i < hi) {
+            unsigned int qChainKey = alnLines[i].qChainKey;
+            unsigned int qLocalId = (unsigned int)(std::lower_bound(qChainKeys.begin(), qChainKeys.end(), qChainKey) - qChainKeys.begin());
+            Chain qChain(qComplexId, qChainKey);
+            bool queryInited = false;
+            bool havePrevDb = false;
+            unsigned int prevDbKey = 0;
+            while (i < hi && alnLines[i].qChainKey == qChainKey) {
+                unsigned int dbChainKey = alnLines[i].dbChainKey;
+                // Keep only the first row per (qChainKey, dbChainKey); duplicates are adjacent after the
+                // ordinal-tiebroken sort. The old std::map<{q,db},line> likewise ignored later rows for an
+                // already-seen (q,db) pair, so keeping just the first preserves byte-identical behaviour.
+                if (havePrevDb && dbChainKey == prevDbKey) {
+                    i++;
                     continue;
                 }
-                Matcher::result_t dbAlnResult = Matcher::parseAlignmentRecord(data.c_str());
+                havePrevDb = true;
+                prevDbKey = dbChainKey;
+                Matcher::result_t dbAlnResult = Matcher::parseAlignmentRecord(&lineArena[alnLines[i].lineOffset]);
+                // init the aligner once per query chain (qLen is the query chain length, identical for
+                // all its lines), before skipping any empty-backtrace lines -- matches the old order.
+                if (!queryInited) {
+                    size_t qDbId = qCaDbr->getId(qChainKey);
+                    char *qCaData = qCaDbr->getData(qDbId, thread_idx);
+                    size_t qCaLength = qCaDbr->getEntryLen(qDbId);
+                    unsigned int qLen = dbAlnResult.qLen;
+                    float *queryCaData = qCoords.read(qCaData, qLen, qCaLength);
+                    tmAligner->initQuery(queryCaData, &queryCaData[qLen], &queryCaData[qLen * 2], NULL, qLen);
+                    queryInited = true;
+                }
                 if (dbAlnResult.backtrace.empty()) {
-                    alignmentLinesMap.erase({qChainKey, dbChainKey});
+                    i++;
                     continue;
                 }
                 hasBacktrace = true;
-                size_t tCaId = tCaDbr->getId(dbChainKey);
-                char *tCaData = tCaDbr->getData(tCaId, thread_idx);
-                size_t tCaLength = tCaDbr->getEntryLen(tCaId);
+                unsigned int dbLocalId = (unsigned int)(std::lower_bound(dbChainKeys.begin(), dbChainKeys.end(), dbChainKey) - dbChainKeys.begin());
                 unsigned int dbLen = dbAlnResult.dbLen;
-                float *targetCaData = tCoords.read(tCaData, dbLen, tCaLength);
-                dbChain = Chain(dbComplexId, dbChainKey);
+                // decode this target chain's CA only the first time it is seen in this target complex;
+                // copy into the owned arena (Coordinate16 reuses its scratch buffer). Same floats as a
+                // fresh decode, so byte-identical.
+                if (tCaOffset[dbLocalId] == ~0u) {
+                    size_t tCaId = tCaDbr->getId(dbChainKey);
+                    float *decoded = tCoords.read(tCaDbr->getData(tCaId, thread_idx), dbLen, tCaDbr->getEntryLen(tCaId));
+                    tCaOffset[dbLocalId] = (unsigned int) tCaArena.size();
+                    tCaArena.insert(tCaArena.end(), decoded, decoded + 3 * (size_t)dbLen);
+                }
+                float *targetCaData = &tCaArena[tCaOffset[dbLocalId]];
+                Chain dbChain(dbComplexId, dbChainKey);
                 TMaligner::TMscoreResult tmResult = tmAligner->computeTMscore(targetCaData, &targetCaData[dbLen], &targetCaData[dbLen * 2], dbLen, dbAlnResult.qStartPos, dbAlnResult.dbStartPos, Matcher::uncompressAlignment(dbAlnResult.backtrace), dbAlnResult.qLen);
-                currAlns.emplace_back(qChain, dbChain, queryCaData, targetCaData, dbAlnResult, tmResult);
-                alignmentLinesMap.erase({qChainKey, dbChainKey});
+                currAlns.emplace_back(qChain, dbChain, dbAlnResult, tmResult);
+                currAlns.back().qLocalId = qLocalId;
+                currAlns.back().dbLocalId = dbLocalId;
+                currAlns.back().lineIdx = (unsigned int)i;
+                i++;
             }
-        } // for end
+        } // while end
 
         // When no alignment is found.
         if (currAlns.empty()) {
@@ -641,7 +844,7 @@ public:
         searchResult.standardize(monomerIncludeMode);
     }
 
-    void getAssignments(SearchResult &searchResult, std::vector<Assignment> &assignments) {
+    void getAssignments(SearchResult &searchResult, std::vector<Assignment> &assignments, const std::vector<AlnLine> &alnLines) {
         if (maxResLen < maxChainLen * std::min(searchResult.qChainKeys.size(),  searchResult.dbChainKeys.size())) {
             delete tmAligner;
             maxResLen = std::max(searchResult.qChainKeys.size(), searchResult.dbChainKeys.size()) * maxChainLen;
@@ -653,10 +856,28 @@ public:
             finalClusters.clear();
             return;
         }
+        // Reused per-thread buffers for re-decoding the CA coordinates of final-cluster alns.
+        Coordinate16 qCoords;
+        Coordinate16 tCoords;
         for (auto &cluster : finalClusters) {
             Assignment assignment(searchResult.qResidueLen, searchResult.dbResidueLen);
+            // Pre-size the accumulators to their exact final size (each aln contributes `matches` CA
+            // coords to all six vectors and one entry to the per-chain vectors), so appendClusterAln
+            // never reallocates. reserve() only touches capacity, so the result is byte-identical.
+            unsigned int clusterMatches = 0;
             for (auto alnIdx : cluster) {
-                assignment.appendChainToChainAln(searchResult.alnVec[alnIdx]);
+                clusterMatches += searchResult.alnVec[alnIdx].matches;
+            }
+            assignment.qCaXVec.reserve(clusterMatches);
+            assignment.qCaYVec.reserve(clusterMatches);
+            assignment.qCaZVec.reserve(clusterMatches);
+            assignment.dbCaXVec.reserve(clusterMatches);
+            assignment.dbCaYVec.reserve(clusterMatches);
+            assignment.dbCaZVec.reserve(clusterMatches);
+            assignment.matchLenVec.reserve(cluster.size());
+            assignment.chainToChainResults.reserve(cluster.size());
+            for (auto alnIdx : cluster) {
+                appendClusterAln(assignment, searchResult.alnVec[alnIdx], alnLines, qCoords, tCoords);
             }
             // matches==0 ? skip
             if (!assignment.getTmScore(*tmAligner)) {
@@ -674,6 +895,7 @@ private:
     DBReader<unsigned int> &alnDbr;
     DBReader<unsigned int> *qCaDbr;
     DBReader<unsigned int> *tCaDbr;
+    DBReader<unsigned int> *dbLookupReader;
     const unsigned int thread_idx;
     const float minAssignedChainsRatio;
     const int monomerIncludeMode;
@@ -683,6 +905,56 @@ private:
     std::vector<ChainToChainAln> currAlns;
     std::set<cluster_t> finalClusters;
     unsigned int qResLen;
+    // Contiguous storage for the query complex's alignment row strings (null-terminated, back to back),
+    // reused across complexes. AlnLine holds an offset into this instead of a per-row std::string --
+    // avoids millions of small allocations and keeps the rows cache-local.
+    std::vector<char> lineArena;
+    // Per target-complex cache of decoded target CA coordinates (x|y|z, 3*dbLen floats per chain), so a
+    // target chain that aligns to many query chains is decoded once per complex instead of once per
+    // alignment. tCaOffset[dbLocalId] is the chain's offset in tCaArena, or ~0u if not yet decoded.
+    std::vector<float> tCaArena;
+    std::vector<unsigned int> tCaOffset;
+
+    // Re-decode one final-cluster alignment's matched CA coordinates and append them (plus its match
+    // count / per-chain result) to the Assignment. ChainToChainAln deliberately does not store the CA
+    // vectors (memory), so they are reconstructed here for the few alns that reach a cluster: parse the
+    // stored alignment line to recover qStart/dbStart/len/backtrace, re-read the chain CA from the same
+    // CA DB, and replay the exact backtrace walk the ChainToChainAln ctor used -- the appended floats
+    // are therefore bit-identical to the previously in-struct copy, and the per-cluster order is
+    // preserved, so the output is byte-identical.
+    void appendClusterAln(Assignment &assignment, const ChainToChainAln &aln, const std::vector<AlnLine> &alnLines, Coordinate16 &qCoords, Coordinate16 &tCoords) {
+        Matcher::result_t r = Matcher::parseAlignmentRecord(&lineArena[alnLines[aln.lineIdx].lineOffset]);
+        size_t qDbId = qCaDbr->getId(aln.qChain.chainKey);
+        float *qCa = qCoords.read(qCaDbr->getData(qDbId, thread_idx), r.qLen, qCaDbr->getEntryLen(qDbId));
+        size_t tDbId = tCaDbr->getId(aln.dbChain.chainKey);
+        float *tCa = tCoords.read(tCaDbr->getData(tDbId, thread_idx), r.dbLen, tCaDbr->getEntryLen(tDbId));
+        unsigned int qPos = r.qStartPos;
+        unsigned int dbPos = r.dbStartPos;
+        for (char cigar : r.backtrace) {
+            if (cigar == 'M') {
+                assignment.qCaXVec.emplace_back(qCa[qPos]);
+                assignment.qCaYVec.emplace_back(qCa[r.qLen + qPos]);
+                assignment.qCaZVec.emplace_back(qCa[r.qLen * 2 + qPos]);
+                assignment.dbCaXVec.emplace_back(tCa[dbPos]);
+                assignment.dbCaYVec.emplace_back(tCa[r.dbLen + dbPos]);
+                assignment.dbCaZVec.emplace_back(tCa[r.dbLen * 2 + dbPos]);
+                qPos++;
+                dbPos++;
+            } else if (cigar == 'I') {
+                qPos++;
+            } else if (cigar == 'D') {
+                dbPos++;
+            }
+        }
+        assignment.matches += aln.matches;
+        assignment.matchLenVec.emplace_back(aln.matches);
+        // Re-serialize the per-chain output line only now (final-cluster alns only) instead of storing
+        // it in every ChainToChainAln. resultToBuffer(parseAlignmentRecord(line)) reproduces exactly the
+        // string the old in-struct resultToWrite held, so the output is byte-identical.
+        char buffer[4096];
+        size_t len = Matcher::resultToBuffer(buffer, r, true, true, false);
+        assignment.chainToChainResults.emplace_back(aln.qChain.chainKey, std::string(buffer, len - 1));
+    }
 
     unsigned int getQueryResidueLength(std::vector<unsigned int> &qChainKeys) const {
         unsigned int qResidueLen = 0;
@@ -710,25 +982,6 @@ private:
             dbResidueLen += t3diDbr->sequenceReader->getSeqLen(tDbId);
         }
         return dbResidueLen;
-    }
-
-    static void removeCurrAlnLines(const std::vector<unsigned int> &qChainKeys, const std::vector<unsigned int> &dbChainKeys,  alignmentLinesMap_t &alignmentLinesMap) {
-        for (auto qChainKey: qChainKeys) {
-            for (auto dbChainKey: dbChainKeys) {
-                alignmentLinesMap.erase({qChainKey, dbChainKey});
-            }
-        }
-    }
-
-    static bool getQueryAlnResult(unsigned int qChainKey, const std::vector<unsigned int> &dbChainKeys,  alignmentLinesMap_t &alignmentLinesMap, Matcher::result_t &qAlnResult) {
-        for (auto dbChainKey: dbChainKeys) {
-            if (alignmentLinesMap[{qChainKey, dbChainKey}].empty()) {
-                continue;
-            }
-            qAlnResult = Matcher::parseAlignmentRecord(alignmentLinesMap[{qChainKey, dbChainKey}].c_str());
-            return true;
-        }
-        return false;
     }
 };
 
@@ -795,8 +1048,8 @@ public:
         unsigned int assignmentId,
         Assignment &assignment,
         std::map<unsigned int, std::pair<Assignment, unsigned int>> &tCompBestAssignment,
-        chainKeyToComplexId_t &dbChainKeyToComplexIdMap,
-        complexIdToChainKeys_t &dbComplexIdToChainKeysMap
+        DBReader<unsigned int> &dbLookupReader,
+        std::vector<std::vector<unsigned int>> &dbComplexIdToChainKeys
     ) 
     {
         unsigned int tComplexId;
@@ -832,7 +1085,14 @@ public:
             ComplexDataHandler retComplex = parseScoreComplexResult(data, res);
 
             unsigned int tChainKey = res.dbKey;
-            tComplexId = dbChainKeyToComplexIdMap.at(tChainKey);
+            size_t lookupId = dbLookupReader.getLookupIdByKey(tChainKey);
+            if (lookupId == SIZE_MAX) {
+                return;
+            }
+            tComplexId = dbLookupReader.getLookupFileNumber(lookupId);
+            if (tComplexId >= dbComplexIdToChainKeys.size()) {
+                return;
+            }
 
             qalnlen += abs(res.qEndPos - res.qStartPos) + 1;
             talnlen += abs(res.dbEndPos - res.dbStartPos) + 1;
@@ -846,7 +1106,7 @@ public:
             uString = retComplex.uString;
             tString = retComplex.tString;
 
-            dbChainNum = dbComplexIdToChainKeysMap.at(tComplexId).size();
+            dbChainNum = dbComplexIdToChainKeys[tComplexId].size();
             qidxToqChainKey[i] = qKey;
         }
 
@@ -1102,65 +1362,40 @@ private:
 };
 
 
-static void getlookupInfo(
-        IndexReader* dbr,
-        const std::string &file,
-        std::map<unsigned int, unsigned int> &chainKeyToComplexIdLookup,
-        std::map<unsigned int, std::vector<unsigned int>> &complexIdToChainKeysLookup,
-        std::vector<unsigned int> &complexIdVec,
-        std::map<unsigned int, std::string> &chainKeyToChainNameMap
+// Use the DBReader lookup table as the source of complex membership instead of reparsing .lookup.
+static void buildComplexIdToChainKeys(
+        DBReader<unsigned int> &lookupReader,
+        IndexReader *seqDbr,
+        std::vector<std::vector<unsigned int>> &complexIdToChainKeys,
+        std::vector<unsigned int> *complexIds = NULL
 ) {
-    if (file.length() == 0) {
-        return;
+    DBReader<unsigned int>::LookupEntry *lookup = lookupReader.getLookup();
+    const size_t lookupSize = lookupReader.getLookupSize();
+    unsigned int maxComplexId = 0;
+    for (size_t i = 0; i < lookupSize; i++) {
+        maxComplexId = std::max(maxComplexId, lookup[i].fileNumber);
     }
-    MemoryMapped lookupDB(file, MemoryMapped::WholeFile, MemoryMapped::SequentialScan);
-    char *data = (char *) lookupDB.getData();
-    char *end = data + lookupDB.mappedSize();
-    const char *entry[255];
-    unsigned int maxSet = 0;
-    while (data < end && *data != '\0') {
-        const size_t columns = Util::getWordsOfLine(data, entry, 255);
-        if (columns < 3) {
-            Debug(Debug::WARNING) << "Not enough columns in lookup file " << file << "\n";
+    complexIdToChainKeys.assign(maxComplexId + 1, std::vector<unsigned int>());
+    std::vector<bool> visited;
+    if (complexIds != NULL) {
+        complexIds->clear();
+        visited.assign(maxComplexId + 1, false);
+    }
+    for (size_t i = 0; i < lookupSize; i++) {
+        const unsigned int chainKey = lookup[i].id;
+        if (seqDbr->sequenceReader->getId(chainKey) == NOT_AVAILABLE_CHAIN_KEY) {
             continue;
         }
-        unsigned int complexId = Util::fast_atoi<int>(entry[2]);
-        if (complexId > maxSet) {
-            maxSet = complexId;
+        const unsigned int complexId = lookup[i].fileNumber;
+        if (complexIds != NULL && visited[complexId] == false) {
+            complexIds->emplace_back(complexId);
+            visited[complexId] = true;
         }
-        data = Util::skipLine(data);
+        complexIdToChainKeys[complexId].emplace_back(chainKey);
     }
-
-    data = (char *) lookupDB.getData();
-    end = data + lookupDB.mappedSize();
-    std::vector<bool> isVistedSet(maxSet + 1, false);
-
-    while (data < end && *data != '\0') {
-        const size_t columns = Util::getWordsOfLine(data, entry, 255);
-        if (columns < 3) {
-            Debug(Debug::WARNING) << "Not enough columns in lookup file " << file << "\n";
-            continue;
-        }
-        unsigned int chainKey = Util::fast_atoi<int>(entry[0]);
-        unsigned int chainDbId = dbr->sequenceReader->getId(chainKey);
-        if (chainDbId != NOT_AVAILABLE_CHAIN_KEY) {
-            size_t complexId = Util::fast_atoi<int>(entry[2]);
-            chainKeyToComplexIdLookup.emplace(chainKey, complexId);
-            std::string chainName(entry[1], (entry[2] - entry[1]) - 1);
-            size_t lastUnderscoreIndex = chainName.find_last_of('_');
-            std::string complexName = chainName.substr(0, lastUnderscoreIndex);
-            chainName = chainName.substr(lastUnderscoreIndex + 1, chainName.size()); // 7soy_1.pdb_A -> A
-            chainKeyToChainNameMap.emplace(chainKey, chainName);
-            if (isVistedSet[complexId] == 0){
-                complexIdToChainKeysLookup.emplace(complexId, std::vector<unsigned int>());
-                complexIdVec.emplace_back(complexId);
-                isVistedSet[complexId] = 1;
-            }
-            complexIdToChainKeysLookup.at(complexId).emplace_back(chainKey);
-        }
-        data = Util::skipLine(data);
+    if (complexIds != NULL) {
+        SORT_SERIAL(complexIds->begin(), complexIds->end());
     }
-    lookupDB.close();
 }
 
 int scoremultimer(int argc, const char **argv, const Command &command) {
@@ -1222,24 +1457,20 @@ int scoremultimer(int argc, const char **argv, const Command &command) {
     const float minAssignedChainsRatio = par.minAssignedChainsThreshold > MAX_ASSIGNED_CHAIN_RATIO ? MAX_ASSIGNED_CHAIN_RATIO : par.minAssignedChainsThreshold;
     int monomerIncludeMode = par.monomerIncludeMode;
     std::vector<unsigned int> qComplexIndices;
-    std::vector<unsigned int> dbComplexIndices;
-    chainKeyToComplexId_t qChainKeyToComplexIdMap, dbChainKeyToComplexIdMap;
-    complexIdToChainKeys_t dbComplexIdToChainKeysMap, qComplexIdToChainKeysMap;
-    chainKeyToChainName_t qChainKeyToChainNameMap, dbChainKeyToChainNameMap;
-    std::string qLookupFile = par.db1 + ".lookup";
-    std::string dbLookupFile = par.db2 + ".lookup";
-    getlookupInfo(q3DiDbr, qLookupFile, qChainKeyToComplexIdMap, qComplexIdToChainKeysMap, qComplexIndices, qChainKeyToChainNameMap);
-    if (sameDB) {
-        dbChainKeyToComplexIdMap = qChainKeyToComplexIdMap;
-        dbComplexIdToChainKeysMap = qComplexIdToChainKeysMap;
-        dbComplexIndices = qComplexIndices;
-        dbChainKeyToChainNameMap = qChainKeyToChainNameMap;
-    } else {
-        getlookupInfo(t3DiDbr, dbLookupFile, dbChainKeyToComplexIdMap, dbComplexIdToChainKeysMap, dbComplexIndices, dbChainKeyToChainNameMap);
+    std::vector<std::vector<unsigned int>> qComplexIdToChainKeys;
+    std::vector<std::vector<unsigned int>> dbComplexIdToChainKeysStorage;
+
+    DBReader<unsigned int> qLookupReader(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<unsigned int>::USE_LOOKUP);
+    qLookupReader.open(DBReader<unsigned int>::NOSORT);
+    buildComplexIdToChainKeys(qLookupReader, q3DiDbr, qComplexIdToChainKeys, &qComplexIndices);
+
+    DBReader<unsigned int> *dbLookupReader = &qLookupReader;
+    std::vector<std::vector<unsigned int>> &dbComplexIdToChainKeys = sameDB ? qComplexIdToChainKeys : dbComplexIdToChainKeysStorage;
+    if (!sameDB) {
+        dbLookupReader = new DBReader<unsigned int>(par.db2.c_str(), par.db2Index.c_str(), par.threads, DBReader<unsigned int>::USE_LOOKUP);
+        dbLookupReader->open(DBReader<unsigned int>::NOSORT);
+        buildComplexIdToChainKeys(*dbLookupReader, t3DiDbr, dbComplexIdToChainKeysStorage);
     }
-    // seems not used
-    // qChainKeyToChainNameMap.clear();
-    // dbChainKeyToChainNameMap.clear();
     Debug::Progress progress(qComplexIndices.size());
 
 #pragma omp parallel
@@ -1253,35 +1484,44 @@ int scoremultimer(int argc, const char **argv, const Command &command) {
 #endif
         resultToWrite_t resultToWrite;
         resultToWrite_t currentResultToWrite;
-        alignmentLinesMap_t alignmentLinesMap;
+        std::vector<AlnLine> alnLines;
         SearchResult searchResult;
         std::vector<Assignment> assignments;
         std::map<unsigned int, std::pair<Assignment, unsigned int>> tCompBestAssignment;
-        ComplexScorer complexScorer(q3DiDbr, t3DiDbr, alnDbr, qCaDbr, tCaDbr, thread_idx, minAssignedChainsRatio, monomerIncludeMode);
+        ComplexScorer complexScorer(q3DiDbr, t3DiDbr, alnDbr, qCaDbr, tCaDbr, dbLookupReader, thread_idx, minAssignedChainsRatio, monomerIncludeMode);
 #pragma omp for schedule(dynamic, 1)
         // for each q complex
         for (size_t qCompIdx = 0; qCompIdx < qComplexIndices.size(); qCompIdx++) {
             unsigned int qComplexId = qComplexIndices[qCompIdx];
-            std::vector<unsigned int> &qChainKeys = qComplexIdToChainKeysMap.at(qComplexId);
+            std::vector<unsigned int> &qChainKeys = qComplexIdToChainKeys[qComplexId];
             if (monomerIncludeMode == SKIP_MONOMERS && qChainKeys.size() < MULTIPLE_CHAINED_COMPLEX) {
                 progress.updateProgress();
                 continue;
             }
-            // read the search file only once
-            complexScorer.getSearchResultLinesMap(qChainKeys, alignmentLinesMap);
-            if (alignmentLinesMap.empty()) {
+            // read the whole query complex's alignments once, streamed into a vector grouped (sorted)
+            // by target complex. The hit target complexes fall out as the distinct dbComplexId runs.
+            complexScorer.buildAlnLines(qChainKeys, alnLines);
+            if (alnLines.empty()) {
+                progress.updateProgress();
                 continue;
             }
-            // for each db complex
-            for (size_t dbId = 0; dbId < dbComplexIndices.size(); dbId++) {
-                unsigned int dbComplexId = dbComplexIndices[dbId];
-                std::vector<unsigned int> &dbChainKeys = dbComplexIdToChainKeysMap.at(dbComplexId);
-                complexScorer.getSearchResultByDbComplex(qComplexId, dbComplexId, qChainKeys, dbChainKeys, alignmentLinesMap, searchResult);
-                if (searchResult.alnVec.empty()) {
-                    continue;
+            // each contiguous run of equal dbComplexId is one target complex, in ascending order
+            size_t runStart = 0;
+            while (runStart < alnLines.size()) {
+                unsigned int dbComplexId = alnLines[runStart].dbComplexId;
+                size_t runEnd = runStart;
+                while (runEnd < alnLines.size() && alnLines[runEnd].dbComplexId == dbComplexId) {
+                    runEnd++;
                 }
-                complexScorer.getAssignments(searchResult, assignments);
-                searchResult.clear();
+                std::vector<unsigned int> &dbChainKeys = dbComplexIdToChainKeys[dbComplexId];
+                if (!dbChainKeys.empty()) {
+                    complexScorer.scoreDbComplexGroup(qComplexId, dbComplexId, qChainKeys, dbChainKeys, alnLines, runStart, runEnd, searchResult);
+                    if (!searchResult.alnVec.empty()) {
+                        complexScorer.getAssignments(searchResult, assignments, alnLines);
+                        searchResult.clear();
+                    }
+                }
+                runStart = runEnd;
             }
             SORT_SERIAL(assignments.begin(), assignments.end(), compareAssignment);
             // Filter when multimercluster OR filtering paramters are set by user.
@@ -1291,7 +1531,7 @@ int scoremultimer(int argc, const char **argv, const Command &command) {
                 filter.computeInterfaceRegion();
                 // for each assignment, filter
                 for (unsigned int assignmentId = 0; assignmentId < assignments.size(); assignmentId++){
-                    filter.filterAssignment(assignmentId, assignments[assignmentId], tCompBestAssignment, dbChainKeyToComplexIdMap, dbComplexIdToChainKeysMap);
+                    filter.filterAssignment(assignmentId, assignments[assignmentId], tCompBestAssignment, *dbLookupReader, dbComplexIdToChainKeys);
                 }
                 for (size_t qChainKeyIdx = 0; qChainKeyIdx < qChainKeys.size(); qChainKeyIdx++) {
                     resultToWrite.clear();
@@ -1329,7 +1569,7 @@ int scoremultimer(int argc, const char **argv, const Command &command) {
                 }
             }
 
-            alignmentLinesMap.clear();
+            alnLines.clear();
             assignments.clear();
             currentResultToWrite.clear();
             resultToWrite.clear();
@@ -1345,6 +1585,11 @@ int scoremultimer(int argc, const char **argv, const Command &command) {
         delete q3DiDbr;
         qCaDbr->close();
         delete qCaDbr;
+    }
+    qLookupReader.close();
+    if (!sameDB) {
+        dbLookupReader->close();
+        delete dbLookupReader;
     }
     resultWriter.close(false);
     return EXIT_SUCCESS;
