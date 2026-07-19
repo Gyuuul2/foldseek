@@ -160,6 +160,21 @@ struct NeighborsWithDist {
     float dist;
 };
 
+// One edge of the single-linkage minimum spanning tree over the 12-D superposition points. With MIN_PTS==2
+// a DBSCAN clustering at radius eps is exactly the connected components of the eps-graph (single linkage),
+// so cutting the MST at eps (keeping edges with weight < eps) reproduces every eps level without re-flooding.
+struct MstEdge {
+    float w;
+    unsigned int u;
+    unsigned int v;
+};
+
+bool compareMstEdge(const MstEdge &a, const MstEdge &b) {
+    if (a.w != b.w) return a.w < b.w;
+    if (a.u != b.u) return a.u < b.u;
+    return a.v < b.v;
+}
+
 bool compareChainToChainAlnByDbComplexId(const ChainToChainAln &first, const ChainToChainAln &second) {
     if (first.dbChain.complexId < second.dbChain.complexId) {
         return true;
@@ -218,7 +233,12 @@ bool compareNeighborWithDist(const NeighborsWithDist &first, const NeighborsWith
         return true;
     if (first.dist > second.dist)
         return false;
-    return false;
+    // Tiebreak by alignment index (house style: see compareAlnLine's `ordinal`, compareChainToChainAln).
+    // Makes getNearestNeighbors' 1:1 trimming order-independent (equal center-distances no longer resolve
+    // by the flood-fill visitation order), which removes the last nondeterminism blocking a union-find /
+    // connected-components DBSCAN from reproducing the result. Changes output only when two neighbors are
+    // exactly equidistant from the center (e.g. symmetric complexes) -- validated on the benchmark.
+    return first.neighbor < second.neighbor;
 }
 
 void getResult(std::string &result, std::string &currentResult, const Assignment &assignment) {
@@ -235,99 +255,14 @@ void getResult(std::string &result, std::string &currentResult, const Assignment
     result.append(currentResult);
 }
 
-// Below this many alignments the brute-force O(n) neighbor scan is cheaper than building a tree.
-// (Memory is O(n) on both paths; this only trades tree-build overhead vs scan cost.)
-#define KD_TREE_MIN_POINTS 64
-
-// Adaptive neighbor search for DBSCAN. For large alignment counts we build a k-d tree over the
-// 12-D superposition vectors so an eps-radius neighbor query costs ~O(log n) instead of O(n),
-// with only O(n) memory (no O(n^2) distance matrix). Descent uses a small margin so a true
-// neighbor (by the exact ChainToChainAln::getDistance) is never pruned away; the exact distance
-// test decides membership, so the returned set is identical to the brute-force scan.
-class SuperpositionKdTree {
-public:
-    void build(const std::vector<ChainToChainAln> &alns) {
-        alns_ = &alns;
-        size_t n = alns.size();
-        point_.assign(n, 0);
-        splitAxis_.assign(n, 0);
-        left_.assign(n, -1);
-        right_.assign(n, -1);
-        order_.resize(n);
-        for (size_t i = 0; i < n; i++) {
-            order_[i] = (unsigned int) i;
-        }
-        nodeCount_ = 0;
-        root_ = buildRec(0, n, 0);
-    }
-
-    // Appends every j (j != queryIdx) with getDistance(queryIdx, j) < eps. Order is unspecified;
-    // the caller sorts to match the brute-force ordering.
-    void rangeQuery(unsigned int queryIdx, float eps, std::vector<unsigned int> &out) const {
-        queryRec(root_, queryIdx, eps, out);
-    }
-
-private:
-    const std::vector<ChainToChainAln> *alns_;
-    std::vector<unsigned int> point_;   // node id -> alignment index
-    std::vector<int> splitAxis_;
-    std::vector<int> left_;
-    std::vector<int> right_;
-    std::vector<unsigned int> order_;   // working index buffer (partitioned during build)
-    int root_;
-    int nodeCount_;
-
-    int buildRec(size_t lo, size_t hi, int depth) {
-        if (lo >= hi) {
-            return -1;
-        }
-        const std::vector<ChainToChainAln> &alns = *alns_;
-        int axis = depth % (int) SIZE_OF_SUPERPOSITION_VECTOR;
-        size_t mid = lo + (hi - lo) / 2;
-        std::nth_element(order_.begin() + lo, order_.begin() + mid, order_.begin() + hi,
-            [&alns, axis](unsigned int a, unsigned int b) {
-                return alns[a].superposition[axis] < alns[b].superposition[axis];
-            });
-        int node = nodeCount_++;
-        point_[node] = order_[mid];
-        splitAxis_[node] = axis;
-        left_[node] = buildRec(lo, mid, depth + 1);
-        right_[node] = buildRec(mid + 1, hi, depth + 1);
-        return node;
-    }
-
-    void queryRec(int node, unsigned int q, float eps, std::vector<unsigned int> &out) const {
-        if (node < 0) {
-            return;
-        }
-        const std::vector<ChainToChainAln> &alns = *alns_;
-        unsigned int p = point_[node];
-        if (p != q && alns[q].getDistance(alns[p]) < eps) {
-            out.emplace_back(p);
-        }
-        int axis = splitAxis_[node];
-        double diff = (double) alns[q].superposition[axis] - (double) alns[p].superposition[axis];
-        // conservative: also descend the far side unless it is provably beyond eps
-        double reach = (double) eps + ((double) eps * 1e-3 + 1e-4);
-        if (diff <= 0.0) {
-            queryRec(left_[node], q, eps, out);
-            if (-diff < reach) {
-                queryRec(right_[node], q, eps, out);
-            }
-        } else {
-            queryRec(right_[node], q, eps, out);
-            if (diff < reach) {
-                queryRec(left_[node], q, eps, out);
-            }
-        }
-    }
-};
 
 class DBSCANCluster {
 public:
     DBSCANCluster(SearchResult &searchResult, std::set<cluster_t> &finalClusters, float minCov) : searchResult(searchResult), finalClusters(finalClusters) {
-        useKdTree = false;
-        cLabel = 0;
+        // This clustering is single-linkage: it relies on MIN_PTS == 2 (every non-noise alignment is a core
+        // point, so a cluster is exactly a connected component of the eps-graph). buildMST + a union-find
+        // eps sweep then reproduce every DBSCAN eps level. If MIN_PTS changed, this assumption would break.
+        static_assert(MIN_PTS == 2, "single-linkage MST/union-find DBSCAN assumes MIN_PTS == 2");
         minimumClusterSize = std::ceil((float) searchResult.qChainKeys.size() * minCov);
         maximumClusterSize = std::min(searchResult.qChainKeys.size(), searchResult.dbChainKeys.size());
         maximumClusterNum = searchResult.alnVec.size() / maximumClusterSize;
@@ -344,18 +279,14 @@ public:
 
         // rbh filter
         filterAlnsByRBH();
-        initEpsRange();
-        // For large alignment counts, a k-d tree makes neighbor queries ~O(log n) with O(n) memory;
-        // small counts stay on the brute-force scan. alnVec is fixed from here (only labels change).
-        useKdTree = searchResult.alnVec.size() > KD_TREE_MIN_POINTS;
-        if (useKdTree) {
-            kdTree.build(searchResult.alnVec);
-        }
-        // To skip DBSCAN clustering when alignments are few enough.
+
+        // Skip clustering when there are too few alignments to need it; otherwise run the single-linkage
+        // MST + union-find DBSCAN (runDBSCANUnionFind -> buildMST is self-contained: it computes the min/max
+        // pairwise distance and the MST, replacing the old all-pairs eps-range scan).
         if (searchResult.alnVec.size() <= maximumClusterSize)
             return checkClusteringNecessity();
 
-        return runDBSCAN();
+        return runDBSCANUnionFind();
     }
 
 private:
@@ -364,19 +295,12 @@ private:
     float maxDist;
     float minDist;
     float learningRate;
-    unsigned int cLabel;
     unsigned int maximumClusterNum;
     unsigned int prevMaxClusterSize;
     unsigned int currMaxClusterSize;
     unsigned int maximumClusterSize;
     unsigned int minimumClusterSize;
     std::vector<unsigned int> neighbors;
-    std::vector<unsigned int> neighborsOfCurrNeighbor;
-    // Membership set of alignment indices already pulled into the current cluster, kept as a reused
-    // epoch-stamped array instead of a hash set: foundEpoch[i] == curEpoch means "already added". Bumping
-    // curEpoch per cluster is an O(1) clear, so there is no per-cluster hashing or reallocation.
-    std::vector<size_t> foundEpoch;
-    size_t curEpoch;
     std::vector<NeighborsWithDist> neighborsWithDist;
     // "chain already seen" sets, kept as reused epoch-stamped arrays indexed by local chain id instead
     // of hash sets of chain keys: qFoundEpoch[localId] == chainEpoch means seen. Bumping chainEpoch is
@@ -390,8 +314,30 @@ private:
     // reused across pairs -- replaces the old chainKey-keyed std::map.
     std::vector<float> qBestScore;
     std::vector<float> dbBestScore;
-    bool useKdTree;
-    SuperpositionKdTree kdTree;
+    // Single-linkage (MIN_PTS==2) clustering state: the MST edges (sorted by weight) plus a union-find that
+    // merges them as eps grows, so every eps level is a connected-component cut -- no per-eps re-flooding,
+    // no O(n^2) distance matrix (O(n) memory).
+    std::vector<unsigned int> ufParent;
+    std::vector<unsigned int> ufRank;
+    std::vector<MstEdge> mstEdges;
+    std::vector<std::vector<unsigned int>> compBuckets;   // reused per change-step: root -> members (ascending index)
+
+    unsigned int ufFind(unsigned int x) {
+        while (ufParent[x] != x) {
+            ufParent[x] = ufParent[ufParent[x]];   // path halving
+            x = ufParent[x];
+        }
+        return x;
+    }
+
+    void ufUnion(unsigned int a, unsigned int b) {
+        a = ufFind(a);
+        b = ufFind(b);
+        if (a == b) return;
+        if (ufRank[a] < ufRank[b]) std::swap(a, b);
+        ufParent[b] = a;
+        if (ufRank[a] == ufRank[b]) ufRank[a]++;
+    }
 
     bool earlyStopForMonomers() {
         if (minimumClusterSize >= MULTIPLE_CHAINED_COMPLEX)
@@ -409,76 +355,113 @@ private:
         }
     }
 
-    bool runDBSCAN() {
-        unsigned int neighborIdx;
-        unsigned int neighborAlnIdx;
-        foundEpoch.assign(searchResult.alnVec.size(), 0);
-        curEpoch = 0;
-        while (eps < maxDist) {
-            initializeAlnLabels();
-            for (size_t centerAlnIdx = 0; centerAlnIdx < searchResult.alnVec.size(); centerAlnIdx++) {
-                ChainToChainAln &centerAln = searchResult.alnVec[centerAlnIdx];
-                if (centerAln.label != 0)
-                    continue;
 
-                getNeighbors(centerAlnIdx, neighbors);
-                if (neighbors.size() < MIN_PTS)
-                    continue;
-
-                centerAln.label = ++cLabel;
-                curEpoch++;
-                for (auto initNeighbor : neighbors) {
-                    foundEpoch[initNeighbor] = curEpoch;
-                }
-                neighborIdx = 0;
-                while (neighborIdx < neighbors.size()) {
-                    neighborAlnIdx = neighbors[neighborIdx++];
-                    if (centerAlnIdx == neighborAlnIdx)
-                        continue;
-
-                    ChainToChainAln &neighborAln = searchResult.alnVec[neighborAlnIdx];
-                    neighborAln.label = cLabel;
-                    getNeighbors(neighborAlnIdx, neighborsOfCurrNeighbor);
-                    if (neighborsOfCurrNeighbor.size() < MIN_PTS)
-                        continue;
-
-                    for (auto neighbor : neighborsOfCurrNeighbor) {
-                        if (foundEpoch[neighbor] != curEpoch) {
-                            foundEpoch[neighbor] = curEpoch;
-                            neighbors.emplace_back(neighbor);
-                        }
-                    }
-                }
-                if (neighbors.size() > maximumClusterSize || checkChainRedundancy())
-                    getNearestNeighbors(centerAlnIdx);
-
-                // too small cluster
-                if (neighbors.size() < currMaxClusterSize)
-                    continue;
-
-                // new Biggest cluster
-                if (neighbors.size() > currMaxClusterSize) {
-                    currMaxClusterSize = neighbors.size();
-                    currClusters.clear();
-                }
-                SORT_SERIAL(neighbors.begin(), neighbors.end());
-                currClusters.emplace_back(neighbors);
+    // Dense-Prim single-linkage MST over the 12-D superposition points. O(n^2) distance evaluations (each
+    // pair exactly once) but only O(n) memory (no distance matrix). One pass yields both the min/max
+    // pairwise distance (the eps sweep range) and the n-1 MST edges used to replay every eps level.
+    void buildMST() {
+        const size_t n = searchResult.alnVec.size();
+        mstEdges.clear();
+        if (n < 2) {
+            eps = minDist;   // min/maxDist keep their sentinels; the sweep loop below is then skipped
+            return;
+        }
+        mstEdges.reserve(n - 1);
+        std::vector<char> inTree(n, 0);
+        std::vector<float> minEdge(n, FLT_MAX);
+        std::vector<unsigned int> minFrom(n, 0);
+        inTree[0] = 1;
+        for (size_t v = 1; v < n; v++) {
+            float d = searchResult.alnVec[0].getDistance(searchResult.alnVec[v]);
+            minEdge[v] = d;
+            minFrom[v] = 0;
+            maxDist = std::max(maxDist, d);
+            minDist = std::min(minDist, d);
+        }
+        for (size_t it = 1; it < n; it++) {
+            float best = FLT_MAX;
+            size_t u = n;
+            for (size_t v = 0; v < n; v++) {
+                if (!inTree[v] && minEdge[v] < best) { best = minEdge[v]; u = v; }
             }
+            inTree[u] = 1;
+            MstEdge e;
+            e.w = best;
+            e.u = minFrom[u];
+            e.v = (unsigned int) u;
+            mstEdges.emplace_back(e);
+            for (size_t v = 0; v < n; v++) {
+                if (inTree[v]) continue;
+                float d = searchResult.alnVec[u].getDistance(searchResult.alnVec[v]);
+                maxDist = std::max(maxDist, d);
+                minDist = std::min(minDist, d);
+                if (d < minEdge[v]) { minEdge[v] = d; minFrom[v] = (unsigned int) u; }
+            }
+        }
+        SORT_SERIAL(mstEdges.begin(), mstEdges.end(), compareMstEdge);
+        eps = minDist;
+    }
+
+    // Extract one eps level's clusters from the current union-find components (the classic DBSCAN per-cluster
+    // step: getNearestNeighbors 1:1 trimming, then keep the largest cluster(s) in currClusters), iterating
+    // connected components instead of flood-filling. Each component (>= MIN_PTS members) is one cluster; its
+    // min-index member is the seed/center (matching an ascending scan over alignment indices).
+    void extractComponents(size_t n) {
+        currMaxClusterSize = 0;
+        currClusters.clear();
+        for (size_t i = 0; i < n; i++) compBuckets[i].clear();
+        for (size_t i = 0; i < n; i++) compBuckets[ufFind((unsigned int) i)].emplace_back((unsigned int) i);
+        for (size_t r = 0; r < n; r++) {
+            std::vector<unsigned int> &members = compBuckets[r];
+            if (members.size() < MIN_PTS) continue;   // singleton / too small -> not a cluster
+            const unsigned int centerIdx = members[0];   // min-index member == flood-fill seed
+            neighbors = members;                          // getNearestNeighbors/checkChainRedundancy read `neighbors`
+            if (neighbors.size() > maximumClusterSize || checkChainRedundancy())
+                getNearestNeighbors(centerIdx);
+            if (neighbors.size() < currMaxClusterSize) continue;
+            if (neighbors.size() > currMaxClusterSize) {
+                currMaxClusterSize = neighbors.size();
+                currClusters.clear();
+            }
+            SORT_SERIAL(neighbors.begin(), neighbors.end());
+            currClusters.emplace_back(neighbors);
+        }
+    }
+
+    // MIN_PTS==2 single-linkage DBSCAN eps sweep: build the MST once, then union its edges as eps grows and
+    // re-extract only when the components actually change (a no-change eps step yields the identical
+    // clustering, so it is skipped). Same eps grid (minDist, +=learningRate) and termination as classic DBSCAN.
+    bool runDBSCANUnionFind() {
+        const size_t n = searchResult.alnVec.size();
+        buildMST();
+        ufParent.resize(n);
+        ufRank.assign(n, 0);
+        for (size_t i = 0; i < n; i++) ufParent[i] = (unsigned int) i;
+        if (compBuckets.size() < n) compBuckets.resize(n);
+        size_t edgePtr = 0;
+        while (eps < maxDist) {
+            bool changed = false;
+            while (edgePtr < mstEdges.size() && mstEdges[edgePtr].w < eps) {
+                ufUnion(mstEdges[edgePtr].u, mstEdges[edgePtr].v);
+                edgePtr++;
+                changed = true;
+            }
+            if (!changed) {   // no new edge crossed eps -> eps-graph unchanged -> same result as prev step
+                eps += learningRate;
+                continue;
+            }
+            extractComponents(n);
 
             if (!finalClusters.empty() && currClusters.empty())
                 return finishDBSCAN();
-
             if (currMaxClusterSize < prevMaxClusterSize)
                 return finishDBSCAN();
-
             if (currMaxClusterSize > prevMaxClusterSize) {
                 finalClusters.clear();
                 prevMaxClusterSize = currMaxClusterSize;
             }
-
             if (currMaxClusterSize >= minimumClusterSize)
                 finalClusters.insert(currClusters.begin(), currClusters.end());
-
             if (currMaxClusterSize == maximumClusterSize && finalClusters.size() == maximumClusterNum)
                 return finishDBSCAN();
 
@@ -489,53 +472,6 @@ private:
             getSingleChainedCluster();
 
         return finishDBSCAN();
-    }
-
-    // Lazy DBSCAN: no O(n^2) distance matrix is stored -- materializing N(N-1)/2 floats OOMs for very
-    // large complexes (e.g. a 1356-mer would need terabytes). This single pass only determines the eps
-    // range (min/max pairwise distance); individual distances are recomputed on demand in
-    // getNeighbors/getNearestNeighbors via ChainToChainAln::getDistance (a cheap 12-dim vector distance).
-    void initEpsRange() {
-        for (size_t i = 0; i < searchResult.alnVec.size(); i++) {
-            const ChainToChainAln &prevAln = searchResult.alnVec[i];
-            for (size_t j = i + 1; j < searchResult.alnVec.size(); j++) {
-                float dist = prevAln.getDistance(searchResult.alnVec[j]);
-                maxDist = std::max(maxDist, dist);
-                minDist = std::min(minDist, dist);
-            }
-        }
-        eps = minDist;
-    }
-
-    void getNeighbors(size_t centerIdx, std::vector<unsigned int> &neighborVec) const {
-        neighborVec.clear();
-        neighborVec.emplace_back(centerIdx);
-        if (useKdTree) {
-            // tree returns the same set as the scan below; sort to reproduce ascending-index order
-            kdTree.rangeQuery(centerIdx, eps, neighborVec);
-            std::sort(neighborVec.begin() + 1, neighborVec.end());
-            return;
-        }
-        const ChainToChainAln &centerAln = searchResult.alnVec[centerIdx];
-        for (size_t neighborIdx = 0; neighborIdx < searchResult.alnVec.size(); neighborIdx++) {
-
-            if (neighborIdx == centerIdx)
-                continue;
-
-            if (centerAln.getDistance(searchResult.alnVec[neighborIdx]) >= eps)
-                continue;
-
-            neighborVec.emplace_back(neighborIdx);
-        }
-    }
-
-    void initializeAlnLabels() {
-        for (auto &aln : searchResult.alnVec) {
-            aln.label = INITIALIZED_LABEL;
-        }
-        cLabel = INITIALIZED_LABEL;
-        currMaxClusterSize = 0;
-        currClusters.clear();
     }
 
     bool checkChainRedundancy() {
@@ -564,7 +500,7 @@ private:
         // Redundant chains => DBSCAN clustering
         if (checkChainRedundancy()) {
             neighbors.clear();
-            return runDBSCAN();
+            return runDBSCANUnionFind();
         }
         // Already good => finish it without clustering
         finalClusters.insert(neighbors);
@@ -572,9 +508,7 @@ private:
     }
 
     bool finishDBSCAN() {
-        initializeAlnLabels();
         neighbors.clear();
-        neighborsOfCurrNeighbor.clear();
         neighborsWithDist.clear();
         return !finalClusters.empty();
     }
@@ -761,6 +695,24 @@ public:
         if (distinctQ != qChainKeys.size()) {
             return;
         }
+        // Coverage pushdown: a 1:1 assignment can be at most min(distinct q, distinct target chains)
+        // large, and filterAlnsByRBH later clears the pair if that is below minimumClusterSize. distinct
+        // query chains == roster here (abandon passed), so only the target side can be short. Count the
+        // distinct target chains BEFORE any computeTMscore; if already below the threshold, RBH would
+        // clear it regardless (raw distinct >= surviving distinct), so skip now and save all the TM work.
+        unsigned int minClusterSize = (unsigned int) std::ceil((float) qChainKeys.size() * minAssignedChainsRatio);
+        dbSeenScratch.assign(dbChainKeys.size(), 0);
+        unsigned int distinctDb = 0;
+        for (size_t i = lo; i < hi; i++) {
+            unsigned int dbLocalId = (unsigned int)(std::lower_bound(dbChainKeys.begin(), dbChainKeys.end(), alnLines[i].dbChainKey) - dbChainKeys.begin());
+            if (!dbSeenScratch[dbLocalId]) {
+                dbSeenScratch[dbLocalId] = 1;
+                distinctDb++;
+            }
+        }
+        if (distinctDb < minClusterSize) {
+            return;
+        }
 
         Coordinate16 qCoords;
         Coordinate16 tCoords;
@@ -914,6 +866,8 @@ private:
     // alignment. tCaOffset[dbLocalId] is the chain's offset in tCaArena, or ~0u if not yet decoded.
     std::vector<float> tCaArena;
     std::vector<unsigned int> tCaOffset;
+    // scratch for the coverage pushdown: marks which target chains appear in a group (by local id)
+    std::vector<char> dbSeenScratch;
 
     // Re-decode one final-cluster alignment's matched CA coordinates and append them (plus its match
     // count / per-chain result) to the Assignment. ChainToChainAln deliberately does not store the CA
